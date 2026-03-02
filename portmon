@@ -1,0 +1,321 @@
+#!/bin/bash
+#
+# PortMon - Linux Port Traffic Monitor
+# A lightweight tool for monitoring per-port network traffic using iptables
+#
+# Author: Claw (xiatian)
+# Repository: https://github.com/xiatian/portmon
+# License: MIT
+#
+
+set -e
+
+# Configuration
+DATA_DIR="${DATA_DIR:-/var/lib/portmon}"
+CHAIN="PORTMON"
+REFRESH_INTERVAL="${REFRESH_INTERVAL:-60}"
+
+# Create data directories
+mkdir -p "$DATA_DIR/hourly" "$DATA_DIR/daily" 2>/dev/null || true
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Initialize iptables rules
+init_iptables() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Error: Root privileges required${NC}"
+        exit 1
+    fi
+
+    # Clean up old rules
+    iptables -F "$CHAIN" 2>/dev/null || true
+    iptables -D INPUT -j "$CHAIN" 2>/dev/null || true
+    iptables -D OUTPUT -j "$CHAIN" 2>/dev/null || true
+    iptables -X "$CHAIN" 2>/dev/null || true
+
+    # Create new chain
+    iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
+    iptables -I INPUT -j "$CHAIN"
+    iptables -I OUTPUT -j "$CHAIN"
+
+    echo -e "${GREEN}iptables rules initialized${NC}"
+}
+
+# Add port monitoring rules
+add_port_rules() {
+    local port=$1
+    # Inbound traffic
+    iptables -C "$CHAIN" -p tcp --dport "$port" 2>/dev/null || \
+        iptables -A "$CHAIN" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    iptables -C "$CHAIN" -p udp --dport "$port" 2>/dev/null || \
+        iptables -A "$CHAIN" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    # Outbound traffic
+    iptables -C "$CHAIN" -p tcp --sport "$port" 2>/dev/null || \
+        iptables -A "$CHAIN" -p tcp --sport "$port" -j ACCEPT 2>/dev/null || true
+    iptables -C "$CHAIN" -p udp --sport "$port" 2>/dev/null || \
+        iptables -A "$CHAIN" -p udp --sport "$port" -j ACCEPT 2>/dev/null || true
+}
+
+# Format bytes to human readable
+format_bytes() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" = "0" ] 2>/dev/null; then
+        echo "0 B"
+    elif [ "$bytes" -lt 1024 ] 2>/dev/null; then
+        echo "${bytes} B"
+    elif [ "$bytes" -lt 1048576 ] 2>/dev/null; then
+        echo "$((bytes / 1024)) KB"
+    elif [ "$bytes" -lt 1073741824 ] 2>/dev/null; then
+        echo "$((bytes / 1048576)) MB"
+    else
+        echo "$((bytes / 1073741824)) GB"
+    fi
+}
+
+# Get process name for a port
+get_port_process() {
+    local port=$1
+    local proc=$(ss -tlnp 2>/dev/null | grep ":$port " | head -1 | \
+        sed -n 's/.*users:((\([^)]*\)).*/\1/p' | head -1 | awk -F',' '{print $1}' | tr -d '"')
+    echo "${proc:--}"
+}
+
+# Dump traffic data from iptables
+dump_traffic() {
+    iptables -L "$CHAIN" -v -n -x 2>/dev/null | while read line; do
+        local bytes=$(echo "$line" | awk '{print $2}')
+        local dpt=$(echo "$line" | grep -oP 'dpt:\K[0-9]+')
+        local spt=$(echo "$line" | grep -oP 'spt:\K[0-9]+')
+        if [ -n "$dpt" ]; then
+            echo "IN $dpt $bytes"
+        elif [ -n "$spt" ]; then
+            echo "OUT $spt $bytes"
+        fi
+    done
+}
+
+# Get monitored ports
+get_ports() {
+    iptables -L "$CHAIN" -n 2>/dev/null | grep -oP 'dpt:[0-9]+' | cut -d: -f2 | sort -n | uniq
+}
+
+# Record traffic snapshot
+cmd_record() {
+    local ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local hf="$DATA_DIR/hourly/$(date +%Y%m%d%H).log"
+    local df="$DATA_DIR/daily/$(date +%Y%m%d).log"
+
+    declare -A pin pout
+    while read dir port bytes; do
+        if [ "$dir" = "IN" ]; then pin[$port]=$bytes
+        elif [ "$dir" = "OUT" ]; then pout[$port]=$bytes; fi
+    done < <(dump_traffic)
+
+    for port in $(echo "${!pin[@]}" | tr ' ' '\n' | sort -n); do
+        local proc=$(get_port_process "$port")
+        local line="[$ts] PORT $port IN=${pin[$port]} OUT=${pout[$port]:-0} PROC=$proc"
+        echo "$line" >> "$hf"
+        echo "$line" >> "$df"
+    done
+}
+
+# Show current status
+cmd_status() {
+    echo -e "${CYAN}=== PortMon - Current Traffic Status ===${NC}"
+    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    printf "${YELLOW}%-8s %-20s %15s %15s${NC}\n" "Port" "Process" "Inbound" "Outbound"
+    echo "─────────────────────────────────────────────────────────────────────"
+
+    declare -A pin pout
+    while read dir port bytes; do
+        if [ "$dir" = "IN" ]; then pin[$port]=$bytes
+        elif [ "$dir" = "OUT" ]; then pout[$port]=$bytes; fi
+    done < <(dump_traffic)
+
+    for port in $(echo "${!pin[@]}" | tr ' ' '\n' | sort -n); do
+        local proc=$(get_port_process "$port")
+        proc=${proc:0:18}
+        printf "%-8s %-20s %15s %15s\n" "$port" "$proc" "$(format_bytes ${pin[$port]})" "$(format_bytes ${pout[$port]:-0})"
+    done
+}
+
+# Calculate statistics
+calc_stats() {
+    local log_file=$1
+    local label=$2
+
+    if [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}No data: $label${NC}"
+        return
+    fi
+
+    echo -e "${CYAN}=== $label ===${NC}"
+    echo ""
+    printf "${YELLOW}%-8s %-20s %12s %12s %12s %8s${NC}\n" "Port" "Process" "Inbound" "Outbound" "Total" "Share"
+    echo "────────────────────────────────────────────────────────────────────────────────"
+
+    local ports=$(grep -oP 'PORT \K[0-9]+' "$log_file" | sort -n | uniq)
+    local total=0
+
+    declare -A d_in d_out d_sum d_proc
+    for port in $ports; do
+        local first=$(grep "PORT $port " "$log_file" | head -1)
+        local last=$(grep "PORT $port " "$log_file" | tail -1)
+        local fi=$(echo "$first" | grep -oP 'IN=\K[0-9]+')
+        local fo=$(echo "$first" | grep -oP 'OUT=\K[0-9]+')
+        local li=$(echo "$last" | grep -oP 'IN=\K[0-9]+')
+        local lo=$(echo "$last" | grep -oP 'OUT=\K[0-9]+')
+        local proc=$(echo "$last" | grep -oP 'PROC=\K[^ ]+' | head -1)
+        
+        fi=${fi:-0}; fo=${fo:-0}; li=${li:-0}; lo=${lo:-0}
+        d_in[$port]=$((li - fi))
+        d_out[$port]=$((lo - fo))
+        d_sum[$port]=$((d_in[$port] + d_out[$port]))
+        d_proc[$port]=${proc:-$(get_port_process "$port")}
+        total=$((total + d_sum[$port]))
+    done
+
+    for port in $ports; do
+        local pct=0
+        [ $total -gt 0 ] && pct=$((d_sum[$port] * 100 / total))
+        local proc=${d_proc[$port]:0:18}
+        printf "%-8s %-20s %12s %12s %12s %7s%%\n" \
+            "$port" "$proc" "$(format_bytes ${d_in[$port]})" "$(format_bytes ${d_out[$port]})" \
+            "$(format_bytes ${d_sum[$port]})" "$pct"
+    done
+
+    echo "────────────────────────────────────────────────────────────────────────────────"
+    printf "${GREEN}%-8s %-20s %37s${NC}\n" "Total" "" "$(format_bytes $total)"
+}
+
+# Live monitoring mode
+cmd_live() {
+    echo -e "${GREEN}PortMon background recording started (sampling every ${REFRESH_INTERVAL}s)${NC}"
+    while true; do
+        cmd_record
+        sleep "$REFRESH_INTERVAL"
+    done
+}
+
+# Setup mode - initialize iptables for common ports
+cmd_setup() {
+    init_iptables
+    
+    # Auto-detect listening ports
+    echo -e "${BLUE}Auto-detecting listening ports...${NC}"
+    for port in $(ss -tln 2>/dev/null | awk 'NR>1 {print $4}' | awk -F: '{print $NF}' | sort -n | uniq); do
+        add_port_rules "$port"
+        echo "  Monitoring port: $port"
+    done
+    
+    echo -e "${GREEN}Setup complete!${NC}"
+    echo "Run 'portmon status' to see current traffic"
+}
+
+# Cleanup mode
+cmd_cleanup() {
+    iptables -F "$CHAIN" 2>/dev/null || true
+    iptables -D INPUT -j "$CHAIN" 2>/dev/null || true
+    iptables -D OUTPUT -j "$CHAIN" 2>/dev/null || true
+    iptables -X "$CHAIN" 2>/dev/null || true
+    echo -e "${GREEN}iptables rules cleaned up${NC}"
+}
+
+# Main command handler
+case "${1:-status}" in
+    setup)
+        cmd_setup
+        ;;
+    live)
+        cmd_live
+        ;;
+    status)
+        cmd_status
+        ;;
+    report)
+        case "${2:-today}" in
+            hour)
+                calc_stats "$DATA_DIR/hourly/$(date +%Y%m%d%H).log" "Hourly Stats: $(date '+%Y-%m-%d %H'):00"
+                ;;
+            today)
+                calc_stats "$DATA_DIR/daily/$(date +%Y%m%d).log" "Daily Stats: $(date '+%Y-%m-%d')"
+                ;;
+            yesterday)
+                calc_stats "$DATA_DIR/daily/$(date -d yesterday +%Y%m%d 2>/dev/null || date -v-1d +%Y%m%d).log" "Yesterday Stats"
+                ;;
+            *)
+                local p="$2"
+                if [ ${#p} -eq 10 ]; then
+                    calc_stats "$DATA_DIR/hourly/${p}.log" "Hourly Stats: ${p:0:4}-${p:4:2}-${p:6:2} ${p:8:2}:00"
+                elif [ ${#p} -eq 8 ]; then
+                    calc_stats "$DATA_DIR/daily/${p}.log" "Daily Stats: ${p:0:4}-${p:4:2}-${p:6:2}"
+                else
+                    echo "Usage: portmon report [hour|today|yesterday|YYYYMMDD|YYYYMMDDHH]"
+                fi
+                ;;
+        esac
+        ;;
+    list)
+        echo -e "${CYAN}=== Available Reports ===${NC}"
+        echo ""
+        echo "Hourly reports:"
+        ls -1 "$DATA_DIR/hourly/" 2>/dev/null | sed 's/.log//' | sort -r | head -24
+        echo ""
+        echo "Daily reports:"
+        ls -1 "$DATA_DIR/daily/" 2>/dev/null | sed 's/.log//' | sort -r | head -7
+        ;;
+    reset)
+        iptables -Z "$CHAIN" 2>/dev/null && echo -e "${GREEN}Counters reset${NC}"
+        ;;
+    cleanup)
+        cmd_cleanup
+        ;;
+    help|--help|-h)
+        cat << 'EOF'
+PortMon - Linux Port Traffic Monitor
+
+Usage: portmon [command] [options]
+
+Commands:
+    setup       Initialize iptables and auto-detect listening ports
+    live        Start background recording (runs every 60s)
+    status      Show current traffic status
+    report      Show traffic statistics
+    list        List available reports
+    reset       Reset iptables counters
+    cleanup     Remove all iptables rules
+    help        Show this help message
+
+Report Options:
+    hour        Current hour statistics
+    today       Today's statistics
+    yesterday   Yesterday's statistics
+    YYYYMMDD    Specific date (e.g., 20260302)
+    YYYYMMDDHH  Specific hour (e.g., 2026030215)
+
+Examples:
+    portmon setup                           # Initial setup
+    portmon status                          # View current traffic
+    portmon report today                    # Today's stats
+    portmon report hour                     # Current hour stats
+    portmon report 20260302                 # Specific date
+    portmon live &                          # Start background recording
+
+Data Storage:
+    Hourly: /var/lib/portmon/hourly/
+    Daily:  /var/lib/portmon/daily/
+
+EOF
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run 'portmon help' for usage information"
+        ;;
+esac
